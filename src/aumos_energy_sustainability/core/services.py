@@ -24,6 +24,7 @@ from aumos_energy_sustainability.core.interfaces import (
     ICarbonRecordRepository,
     IEnergyProfileRepository,
     IEventPublisher,
+    IInferenceOptimizer,
     IOptimizationRepository,
     IRoutingDecisionRepository,
     ISustainabilityReportRepository,
@@ -863,3 +864,169 @@ class OptimizationAdvisorService:
 
         record.status = "dismissed"
         return await self._optimization_repo.update(record)
+
+
+class InferenceOptimizerService:
+    """Orchestrate latency-energy tradeoff optimization for inference serving.
+
+    Delegates computation to the IInferenceOptimizer adapter and publishes
+    Kafka events when optimization recommendations are generated or when
+    A/B experiment verdicts are reached.
+    """
+
+    def __init__(
+        self,
+        inference_optimizer: IInferenceOptimizer,
+        event_publisher: IEventPublisher,
+    ) -> None:
+        """Initialise with injected dependencies.
+
+        Args:
+            inference_optimizer: Adapter implementing inference optimization logic.
+            event_publisher: Kafka event publisher for optimization events.
+        """
+        self._optimizer = inference_optimizer
+        self._event_publisher = event_publisher
+
+    async def tune_batching(
+        self,
+        model_id: str,
+        latency_tier: str,
+        *,
+        avg_input_tokens: int = 512,
+        avg_output_tokens: int = 256,
+        requests_per_second: float = 10.0,
+        gpu_memory_gb: float = 40.0,
+        current_batch_size: int | None = None,
+    ) -> dict[str, Any]:
+        """Compute and return optimal dynamic batching configuration.
+
+        Delegates to the inference optimizer adapter and publishes a Kafka
+        event when the recommendation materially differs from the current config.
+
+        Args:
+            model_id: Model identifier to configure batching for.
+            latency_tier: SLA tier — real_time | near_real_time |
+                batch_interactive | background.
+            avg_input_tokens: Average input token count.
+            avg_output_tokens: Average output token count.
+            requests_per_second: Observed request throughput.
+            gpu_memory_gb: Available GPU memory in GB.
+            current_batch_size: Existing batch size for delta comparison.
+
+        Returns:
+            Batching configuration dict from the adapter.
+
+        Raises:
+            ValueError: If latency_tier is invalid.
+        """
+        config = await self._optimizer.configure_dynamic_batching(
+            model_id,
+            latency_tier,
+            avg_input_tokens=avg_input_tokens,
+            avg_output_tokens=avg_output_tokens,
+            requests_per_second=requests_per_second,
+            gpu_memory_gb=gpu_memory_gb,
+            current_batch_size=current_batch_size,
+        )
+
+        # Publish event when a meaningful change is recommended
+        vs = config.get("vs_current", {})
+        batch_change = abs(vs.get("batch_size_change", 0))
+        if batch_change >= 2:
+            await self._event_publisher.publish(
+                "aumos.energy.inference.batching_tuned",
+                {
+                    "model_id": model_id,
+                    "latency_tier": latency_tier,
+                    "recommended_batch_size": config["recommended_batch_size"],
+                    "batch_size_change": vs.get("batch_size_change", 0),
+                    "energy_change_pct": vs.get("energy_change_pct", 0.0),
+                },
+            )
+
+        logger.info(
+            "Inference batching tuned",
+            model_id=model_id,
+            latency_tier=latency_tier,
+            recommended_batch_size=config["recommended_batch_size"],
+        )
+        return config
+
+    async def get_pareto_frontier(
+        self,
+        model_id: str,
+        *,
+        min_batch_size: int = 1,
+        max_batch_size: int = 128,
+        avg_input_tokens: int = 512,
+        avg_output_tokens: int = 256,
+        base_latency_ms: float = 50.0,
+    ) -> dict[str, Any]:
+        """Retrieve the Pareto frontier of latency vs energy for a model.
+
+        Args:
+            model_id: Model to analyze.
+            min_batch_size: Minimum batch size to evaluate.
+            max_batch_size: Maximum batch size to evaluate.
+            avg_input_tokens: Average input token count.
+            avg_output_tokens: Average output token count.
+            base_latency_ms: Baseline single-request latency.
+
+        Returns:
+            Pareto frontier dict including knee_point and recommendation.
+        """
+        return await self._optimizer.compute_pareto_frontier(
+            model_id,
+            min_batch_size=min_batch_size,
+            max_batch_size=max_batch_size,
+            avg_input_tokens=avg_input_tokens,
+            avg_output_tokens=avg_output_tokens,
+            base_latency_ms=base_latency_ms,
+        )
+
+    async def evaluate_ab_experiment(
+        self,
+        model_id: str,
+        experiment_name: str,
+    ) -> dict[str, Any]:
+        """Evaluate an A/B experiment and publish a verdict event.
+
+        Args:
+            model_id: Model the experiment belongs to.
+            experiment_name: Name of the experiment to evaluate.
+
+        Returns:
+            Comparison dict with verdict, energy_delta_mj, and explanation.
+        """
+        comparison = await self._optimizer.compare_ab_experiment(model_id, experiment_name)
+
+        verdict = comparison.get("verdict", "inconclusive")
+        if verdict in {"treatment_wins", "control_wins"}:
+            await self._event_publisher.publish(
+                "aumos.energy.inference.ab_verdict",
+                {
+                    "model_id": model_id,
+                    "experiment_name": experiment_name,
+                    "verdict": verdict,
+                    "energy_change_pct": comparison.get("energy_change_pct", 0.0),
+                    "latency_regression_ms": comparison.get("latency_regression_ms", 0.0),
+                },
+            )
+
+        logger.info(
+            "A/B experiment evaluated",
+            model_id=model_id,
+            experiment_name=experiment_name,
+            verdict=verdict,
+        )
+        return comparison
+
+
+__all__ = [
+    "CarbonTrackerService",
+    "EnergyRouterService",
+    "InferenceOptimizerService",
+    "OptimizationAdvisorService",
+    "SustainabilityReportService",
+]
