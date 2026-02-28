@@ -32,6 +32,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# GAP-334: Expanded emission factor database
+carbon_apis = [
+    "redis>=5.0.0",       # Redis cache for 5-minute TTL on carbon intensity reads
+]
+# GAP-335: GPU-specific energy measurement
+gpu = [
+    "pynvml>=11.5.0",     # NVIDIA NVML bindings for real-time GPU power (optional)
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
